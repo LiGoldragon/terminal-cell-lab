@@ -1,6 +1,6 @@
 [package]
 name         = "terminal-cell"
-version      = "0.3.0"
+version      = "1.0.0"
 edition      = "2024"
 rust-version = "1.89"
 license      = "MIT OR Apache-2.0"
@@ -20,7 +20,7 @@ portable-pty = "0.8"
 regex        = "1"
 rkyv         = { version = "0.8", default-features = false, features = ["std", "bytecheck", "little_endian", "pointer_width_32", "unaligned"] }
 signal-frame = { git = "https://github.com/LiGoldragon/signal-frame.git", rev = "ca72b2d1151f5b3df536295b2ba68f039536ec19" }
-signal-terminal = { git = "https://github.com/LiGoldragon/signal-terminal.git", rev = "c247cbfe07313696f9053ecfb201fdf9c46e456b" }
+signal-terminal = { git = "https://github.com/LiGoldragon/signal-terminal.git", rev = "ddbd3237a57e3ca19b5f6208a93770c5eee73aa3" }
 signal-hook  = "0.3"
 thiserror    = "2"
 tokio        = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "sync", "time"] }

@@ -1,23 +1,8 @@
 use std::io::{self, Read, Write};
 
-use signal_frame::{
-    ExchangeIdentifier, ExchangeLane, LaneSequence, Reply as SignalReply, SessionEpoch, SubReply,
-};
-
-/// terminal-cell's socket is a synchronous request/reply protocol with
-/// no handshake-negotiated exchange. The exchange identifier is
-/// degenerate but still required by the current `ExchangeFrameBody` shape
-/// per `/177` §3. A future cutover wires real handshake + lane tracking.
-fn synthetic_exchange() -> ExchangeIdentifier {
-    ExchangeIdentifier::new(
-        SessionEpoch::new(0),
-        ExchangeLane::Connector,
-        LaneSequence::first(),
-    )
-}
 use signal_terminal::{
-    Frame as SignalTerminalFrame, FrameBody as SignalFrameBody, Input as SignalTerminalRequest,
-    Output as SignalTerminalEvent,
+    ByteViewable, Query as SignalTerminalRequest, Response as SignalTerminalEvent, Restorable,
+    Signal, Signalizable,
 };
 
 use crate::{
@@ -44,7 +29,7 @@ const GATE_RELEASE_REPLY: u8 = b'U';
 const WAIT_SATISFIED_REPLY: u8 = b'Y';
 const MAXIMUM_FRAME_LENGTH: u64 = 16 * 1024 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SocketRequest {
     Capture,
     SubscribeFromBeginning,
@@ -59,7 +44,7 @@ pub enum SocketRequest {
     Signal(SignalSocketRequest),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SignalSocketRequest {
     payload: SignalTerminalRequest,
 }
@@ -134,53 +119,26 @@ where
     }
 
     fn read_signal_request(&mut self, first_length_byte: u8) -> io::Result<SocketRequest> {
-        let mut length_tail = [0_u8; 3];
-        self.reader.read_exact(&mut length_tail)?;
-        let length = u32::from_be_bytes([
-            first_length_byte,
-            length_tail[0],
-            length_tail[1],
-            length_tail[2],
-        ]) as u64;
+        let mut tail = [0_u8; 3];
+        self.reader.read_exact(&mut tail)?;
+        let length = u32::from_be_bytes([first_length_byte, tail[0], tail[1], tail[2]]) as u64;
         if length > MAXIMUM_FRAME_LENGTH {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("signal frame length {length} exceeds maximum"),
+                "signal length exceeds maximum",
             ));
         }
-
-        let mut bytes = Vec::with_capacity(4 + length as usize);
-        bytes.push(first_length_byte);
-        bytes.extend_from_slice(&length_tail);
-        let mut payload = vec![0_u8; length as usize];
-        self.reader.read_exact(&mut payload)?;
-        bytes.extend_from_slice(&payload);
-
-        let frame = SignalTerminalFrame::decode_length_prefixed(&bytes).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("signal frame decode failed: {error}"),
-            )
-        })?;
-        match frame.into_body() {
-            SignalFrameBody::Request { request, .. } => {
-                let (payload, tail) = request.payloads.into_head_and_tail();
-                if !tail.is_empty() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "expected one signal request payload, got {}",
-                            tail.len() + 1
-                        ),
-                    ));
-                }
-                Ok(SocketRequest::Signal(SignalSocketRequest::new(payload)))
-            }
-            other => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("expected signal request operation, got {other:?}"),
-            )),
-        }
+        let mut bytes = vec![0; length as usize];
+        self.reader.read_exact(&mut bytes)?;
+        let payload = Signal::<SignalTerminalRequest>::from(bytes)
+            .restore()
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("signal query restore failed: {error}"),
+                )
+            })?;
+        Ok(SocketRequest::Signal(SignalSocketRequest::new(payload)))
     }
 
     fn read_frame(&mut self) -> io::Result<Vec<u8>> {
@@ -286,13 +244,17 @@ where
     }
 
     pub fn write_signal_request(&mut self, request: SignalTerminalRequest) -> io::Result<()> {
-        let frame = request.into_frame(synthetic_exchange());
-        let bytes = frame.encode_length_prefixed().map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("signal frame encode failed: {error}"),
-            )
-        })?;
+        let bytes = request
+            .signalize()
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("signal query archive failed: {error}"),
+                )
+            })?
+            .bytes()
+            .to_vec();
+        self.writer.write_all(&(bytes.len() as u32).to_be_bytes())?;
         self.writer.write_all(&bytes)?;
         self.writer.flush()
     }
@@ -376,50 +338,25 @@ where
     }
 
     pub fn read_signal_event(&mut self) -> io::Result<SignalTerminalEvent> {
-        let frame = self.read_signal_frame()?;
-        match frame.into_body() {
-            SignalFrameBody::Reply { reply, .. } => match reply {
-                SignalReply::Accepted { per_operation, .. } => match per_operation.into_head() {
-                    SubReply::Ok(payload) => Ok(payload),
-                    other => Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("expected ok sub-reply for signal event, got {other:?}"),
-                    )),
-                },
-                SignalReply::Rejected { reason } => Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("signal reply rejected: {reason:?}"),
-                )),
-            },
-            other => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("expected signal reply operation, got {other:?}"),
-            )),
-        }
-    }
-
-    fn read_signal_frame(&mut self) -> io::Result<SignalTerminalFrame> {
-        let mut length_bytes = [0_u8; 4];
-        self.reader.read_exact(&mut length_bytes)?;
-        let length = u32::from_be_bytes(length_bytes) as u64;
+        let mut length = [0; 4];
+        self.reader.read_exact(&mut length)?;
+        let length = u32::from_be_bytes(length) as u64;
         if length > MAXIMUM_FRAME_LENGTH {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("signal reply length {length} exceeds maximum"),
+                "signal length exceeds maximum",
             ));
         }
-
-        let mut bytes = Vec::with_capacity(4 + length as usize);
-        bytes.extend_from_slice(&length_bytes);
-        let mut payload = vec![0_u8; length as usize];
-        self.reader.read_exact(&mut payload)?;
-        bytes.extend_from_slice(&payload);
-        SignalTerminalFrame::decode_length_prefixed(&bytes).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("signal frame decode failed: {error}"),
-            )
-        })
+        let mut bytes = vec![0; length as usize];
+        self.reader.read_exact(&mut bytes)?;
+        Signal::<SignalTerminalEvent>::from(bytes)
+            .restore()
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("signal response restore failed: {error}"),
+                )
+            })
     }
 
     fn read_expected_tag(&mut self, expected: u8) -> io::Result<()> {
@@ -521,17 +458,17 @@ where
     }
 
     pub fn write_signal_event(&mut self, event: SignalTerminalEvent) -> io::Result<()> {
-        let frame = event.into_reply_frame(synthetic_exchange());
-        self.write_encoded_frame(frame)
-    }
-
-    fn write_encoded_frame(&mut self, frame: SignalTerminalFrame) -> io::Result<()> {
-        let bytes = frame.encode_length_prefixed().map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("signal frame encode failed: {error}"),
-            )
-        })?;
+        let bytes = event
+            .signalize()
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("signal response archive failed: {error}"),
+                )
+            })?
+            .bytes()
+            .to_vec();
+        self.writer.write_all(&(bytes.len() as u32).to_be_bytes())?;
         self.writer.write_all(&bytes)?;
         self.writer.flush()
     }

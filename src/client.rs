@@ -2,7 +2,7 @@ use std::io;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
-use signal_terminal::{Input as SignalTerminalRequest, Output as SignalTerminalEvent};
+use signal_terminal::{Query as SignalTerminalRequest, Response as SignalTerminalEvent};
 
 use crate::{
     SocketReplyReader, SocketRequestWriter, TerminalInputGateLease, TerminalInputGateRelease,
